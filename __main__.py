@@ -1,17 +1,17 @@
 import highspy, random, time, math
 
-CG_GAP_REL = 1e-4
+CG_GAP_REL = 1e-6
 
 random.seed(100)
 
 #Total number of items
-N = 60
+N = 50
 
 #Item weight
 weights = [round(random.uniform(1, 10),4) for _ in range(N)]
 
 # Bin capacity
-capacity = 15
+capacity = 20
 
 # Maximum number of bins
 B = N # Easy upper bound on the number of bins
@@ -168,7 +168,7 @@ def solveSubproblemExact(duals):
         -highspy.kHighsInf,
         capacity,
         N,
-        [i for i in range(N)],
+        list(range(N)),
         [weights[i] for i in range(N)]
     )
     
@@ -231,7 +231,7 @@ def generateColumns(columns: list, m, msg=True, solve_exact = False, start_time 
 
                 print(row_format.format(*row))
 
-        if obj_sub == 0 or gap < CG_GAP_REL:
+        if abs(obj_sub) < 1e-6 or gap < CG_GAP_REL:
             break
 
         # Adds a new column to the master problem
@@ -283,16 +283,11 @@ class Node:
 
 
 def solveNode(node: Node, columns: list[list[int]], m):
-    lower_bounds = [
-        0 if idx not in node.assigned_columns
-        else 1
-        for idx in range(len(columns))
-    ]
     m.changeColsBounds(
-        len(columns),                       # Qty columns to change bounds
-        list(range(len(columns))),          # Which columns
-        lower_bounds,                       # Lower bound (0 if not assigned else 1)
-        [1]*len(columns)                    # Upper bound (always 1)
+        len(node.assigned_columns),                         # Qty columns to change bounds
+        node.assigned_columns,                              # Which columns
+        [1]*len(node.assigned_columns),                     # Lower bound (0 if not assigned else 1)
+        [1]*len(node.assigned_columns)                      # Upper bound (always 1)
     )
 
     # Making sure that there is no repeated index
@@ -322,8 +317,13 @@ def solveNode(node: Node, columns: list[list[int]], m):
 def getKey(columns_idxs):
     return ",".join(sorted([f"{idx}" for idx in columns_idxs]))
 
-def branchAndPrice(m, vals, columns, start_time=0):    
-    header = ["NodesExpl", "TreeSize", "CurrCols", "FracCols", "Time"]
+def branchAndPrice(m, columns, start_time=0):
+    vals = list(m.getSolution().col_value)
+    ub = math.inf
+    lb = sum(vals)
+
+    header = ["NodesExpl", "TreeSize", "CurrCols", "FracCols", "LB", "UB", "Gap", "Time"]
+    iter_header = 0
     row_format ="{:>12}" * (len(header))
     print(row_format.format(*header))
     
@@ -342,6 +342,9 @@ def branchAndPrice(m, vals, columns, start_time=0):
     best_qtd_frac_columns = math.inf
 
     qty_nodes_visited = 0
+    best_node = None
+
+    log_improvement = False
 
     while len(branch_tree) > 0:
         # Searchs for a node in the last layer,
@@ -365,16 +368,10 @@ def branchAndPrice(m, vals, columns, start_time=0):
             
             qtd_fractional_columns = len(node.final_fractional_columns)
 
-            if qtd_fractional_columns < best_qtd_frac_columns:
-                best_qtd_frac_columns = qtd_fractional_columns
-                print(row_format.format(*[
-                    qty_nodes_visited,
-                    len(branch_tree),
-                    len(columns),
-                    best_qtd_frac_columns,
-                    f"{round(time.perf_counter()-start_time, 2) :.2f}"
-                ]))
-
+            if qtd_fractional_columns < best_qtd_frac_columns or round(time.perf_counter() - start_time) % 5 == 0:
+                log_improvement = True
+                best_qtd_frac_columns = min(best_qtd_frac_columns, qtd_fractional_columns)
+                
             if qtd_fractional_columns > 0:
                 # Adds all fractional columns as new nodes
                 for column_idx in node.final_fractional_columns:
@@ -386,8 +383,55 @@ def branchAndPrice(m, vals, columns, start_time=0):
                         branch_tree = [new_node] + branch_tree
                         branch_tree_dict[key] = new_node
 
-            else:
-                return [column for idx, column in enumerate(node.final_columns) if node.final_columns_vals[idx] > 0.9]
+            elif node.value < ub:
+                best_node = node
+                ub = node.value
+                lb = ub if abs(math.ceil(lb) - ub) < 1e-6 else min(lb, ub)
+
+                print(row_format.format(*[
+                    f"*{qty_nodes_visited}",
+                    len(branch_tree),
+                    len(columns),
+                    best_qtd_frac_columns,
+                    f"{lb :.3f}",
+                    f"{ub :.3f}",
+                    'inf' if ub == math.inf else f"{ub-lb :.3f}",
+                    f"{round(time.perf_counter()-start_time, 2) :.2f}"
+                ]))
+                if ub-lb < 1-1e-6:
+                    return [column for idx, column in enumerate(node.final_columns) if node.final_columns_vals[idx] > 0.9]
+            
+            if log_improvement:
+                if qty_nodes_visited - iter_header >= 30:
+                    print(row_format.format(*header))
+                    iter_header = qty_nodes_visited
+
+                print(row_format.format(*[
+                    qty_nodes_visited,
+                    len(branch_tree),
+                    len(columns),
+                    best_qtd_frac_columns,
+                    f"{lb :.3f}",
+                    f"{ub :.3f}",
+                    'inf' if ub == math.inf else f"{ub-lb :.3f}",
+                    f"{round(time.perf_counter()-start_time, 2) :.2f}"
+                ]))
+
+            # Resets the bounds on the columns
+            m.changeColsBounds(
+                len(columns),                       # Qty columns to change bounds
+                list(range(len(columns))),          # Which columns
+                [0]*len(columns),                   # Lower bound (0 if not assigned else 1)
+                [1]*len(columns)                    # Upper bound (always 1)
+            )
+            m.run()
+            vals = list(m.getSolution().col_value)
+            lb = sum(vals)
+
+        log_improvement = False
+
+    if best_node is not None:
+        return [column for idx, column in enumerate(best_node.final_columns) if best_node.final_columns_vals[idx] > 0.9]
 
     raise Exception("It should not get to this point")
 
@@ -417,7 +461,7 @@ if __name__ == '__main__':
     m, columns, vals = generateColumns(columns, m, solve_exact=True, start_time=start_time)
 
     print("\nBranch-and-price:")
-    bins_cg = branchAndPrice(m, vals, columns, start_time)
+    bins_cg = branchAndPrice(m, columns, start_time)
 
     print(f"\nSolution by column generation: {len(bins_cg)} bins")
     for bin, items in enumerate(bins_cg):
